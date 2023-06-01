@@ -3,6 +3,9 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use tabled::settings::object::{Columns, Object, Rows};
+use tabled::settings::{Alignment, Modify};
+use tabled::Tabled;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -26,7 +29,7 @@ struct RawDuplicatedTransaction {
     height: String,
     hash: String,
     argument: Option<String>,
-    count: String,
+    // count: String,
     neighborhood: String,
 }
 
@@ -63,14 +66,11 @@ impl From<RawDuplicatedTransaction> for DuplicatedTransaction {
 
 type AliasMap = std::collections::BTreeMap<String, String>;
 
-#[derive(Debug, Serialize)]
-struct TransposedEntry(Option<String>, u64);
-
 #[derive(Default, Debug, Serialize)]
-struct TransposedTable(BTreeMap<u64, BTreeMap<String, TransposedEntry>>);
+struct TransposedMintTable(BTreeMap<u64, BTreeMap<String, u64>>);
 
-impl TransposedTable {
-    pub fn insert(&mut self, entry: DuplicatedTransaction, aliases: &AliasMap) {
+impl TransposedMintTable {
+    pub fn insert(&mut self, entry: DuplicatedTransaction) {
         if entry.method != "tokens.mint" {
             return;
         }
@@ -80,16 +80,42 @@ impl TransposedTable {
 
         // We ignore the first one as it is the only _valid_ transaction.
         for (address, amount) in &argument {
-            let alias = aliases.get(address).cloned();
             for height in &entry.heights[1..] {
-                let mut inner = self.0.entry(*height).or_default();
-                let mut entry = inner
-                    .entry(address.clone())
-                    .or_insert(TransposedEntry(alias.clone(), 0));
-                entry.1 += amount.parse::<u64>().unwrap();
+                let inner = self.0.entry(*height).or_default();
+                *inner.entry(address.clone()).or_default() += amount.parse::<u64>().unwrap();
             }
         }
     }
+}
+
+#[derive(Deserialize)]
+struct LedgerSendArgument {
+    from: String,
+    to: String,
+    amount: u64,
+    // Ignore symbol, it doesn't matter.
+}
+
+#[derive(Default, Debug, Serialize)]
+struct TransposedSendTable(pub BTreeMap<(String, String), u64>);
+
+impl TransposedSendTable {
+    pub fn insert(&mut self, entry: DuplicatedTransaction) {
+        if entry.method != "ledger.send" {
+            return;
+        }
+
+        let argument = entry.argument.as_ref().unwrap();
+        let LedgerSendArgument { from, to, amount } = serde_json::from_str(argument).unwrap();
+        *self.0.entry((from, to)).or_default() += amount;
+    }
+}
+
+#[derive(Tabled)]
+struct SummaryRow {
+    address: String,
+    alias: String,
+    total: u64,
 }
 
 fn main() {
@@ -113,35 +139,73 @@ fn main() {
         .unwrap_or_default();
 
     // Filter transactions we're not interested in.
-    let transactions: Vec<DuplicatedTransaction> = transactions
-        .into_iter()
-        .filter(|x| x.method == "tokens.mint")
-        .collect();
+    let transactions: Vec<DuplicatedTransaction> = transactions.into_iter().collect();
 
-    let mut table = TransposedTable::default();
+    let mut mint_table = TransposedMintTable::default();
+    let mut send_table = TransposedSendTable::default();
+
     for t in transactions {
-        table.insert(t, &aliases);
+        if t.method == "tokens.mint" {
+            mint_table.insert(t);
+        } else if t.method == "ledger.send" {
+            eprintln!("...");
+            send_table.insert(t);
+        }
     }
 
     let mut output_csv = csv::Writer::from_writer(vec![]);
-    for (height, entry) in table.0 {
-        for (address, TransposedEntry(alias, amount)) in entry {
+    let mut totals: BTreeMap<String, u64> = BTreeMap::new();
+    for (height, entry) in mint_table.0 {
+        for (address, amount) in entry {
+            let alias = aliases.get(&address).cloned().unwrap_or_default();
+            *totals.entry(address.clone()).or_default() += amount;
             output_csv
-                .write_record(&[
-                    height.to_string(),
-                    address,
-                    alias.unwrap_or_default(),
-                    amount.to_string(),
-                ])
+                .write_record(&[height.to_string(), address, alias, amount.to_string()])
                 .unwrap();
         }
     }
     let data = String::from_utf8(output_csv.into_inner().unwrap()).unwrap();
 
-    // let output_json = serde_json::to_string(&table).unwrap();
+    let summary = totals
+        .iter()
+        .map(|(address, total)| SummaryRow {
+            address: address.clone(),
+            alias: aliases.get(address).cloned().unwrap_or_default(),
+            total: *total,
+        })
+        .collect::<Vec<_>>();
+
     if let Some(x) = output {
         std::fs::write(x, data).unwrap();
     } else {
         println!("{}", data);
+    }
+
+    eprintln!("# Summary");
+    eprintln!(
+        "{}",
+        tabled::Table::new(summary)
+            .with(tabled::settings::Style::markdown())
+            .with(Modify::new(Rows::new(1..).and(Columns::last())).with(Alignment::right()))
+    );
+
+    eprintln!("\nTotal: {}", totals.values().sum::<u64>());
+
+    eprintln!("Send txs:");
+    for ((from, to), amount) in send_table.0.iter() {
+        eprintln!(
+            "{}{} => {}{}    ++ {}",
+            from,
+            aliases
+                .get(from)
+                .map(|a| format!(" ({a})"))
+                .unwrap_or("".to_string()),
+            to,
+            aliases
+                .get(to)
+                .map(|a| format!(" ({a})"))
+                .unwrap_or("".to_string()),
+            amount
+        );
     }
 }

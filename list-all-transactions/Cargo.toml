@@ -13,3 +13,4 @@ csv = "1.2.2"
 hex = "0.4.3"
 serde = { version = "1.0.163", features = ["derive"] }
 serde_json = "1.0.96"
+tabled = "0.12.0"
